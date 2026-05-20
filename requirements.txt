@@ -2,3 +2,4 @@ streamlit==1.57.0
 langchain-core==1.4.0
 langchain-ollama==1.1.0
 langchain-chroma==1.1.0
+pypdf==6.11.0

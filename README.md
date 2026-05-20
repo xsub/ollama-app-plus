@@ -87,19 +87,22 @@ How it works:
 1. The current browser session keeps recent messages in Streamlit session state.
 2. Before answering a new prompt, the app embeds the user question with
    `nomic-embed-text`.
-3. Chroma searches `./memory_db` for the most similar previous exchanges.
+3. Chroma searches the local RAG directory for the most similar previous exchanges.
 4. The prompt receives three context blocks: relevant long-term memory, recent
    conversation, and the current question.
 5. After the assistant response is complete, the user/assistant exchange is saved
    back to Chroma for future retrieval.
 
-The memory database is stored locally in `./memory_db` and is ignored by Git.
+The memory database is stored locally in `.OAP_RAG` by default and is ignored by
+Git. When `DOCS_DIR` is set, the default RAG directory is created inside that
+folder, for example `DOCS_DIR=./knowledge` stores Chroma data in
+`./knowledge/.OAP_RAG`. You can override this with `MEMORY_DIR`.
 
 Useful environment variables:
 
 ```bash
 EMBEDDING_MODEL=nomic-embed-text
-MEMORY_DIR=./memory_db
+MEMORY_DIR=./.OAP_RAG
 MEMORY_RESULTS=4
 RECENT_MESSAGES_LIMIT=6
 ```
@@ -109,3 +112,68 @@ For example:
 ```bash
 MODEL_NAME=llama3.2 EMBEDDING_MODEL=nomic-embed-text streamlit run app.py
 ```
+
+# File-based document memory
+
+The app can also index files from a local directory and use the most relevant
+chunks as context for answers. This is a small local RAG flow for prompts such as
+"read the files in this directory and include them in the answer".
+
+To index one document, use the sidebar file picker and click `Index selected file`.
+This supports text-like files and PDFs. Uploaded files are embedded and stored in
+the local Chroma document collection; the file itself is not copied into the repo.
+
+Set `DOCS_DIR` when a whole directory should be indexed:
+
+```bash
+DOCS_DIR=./knowledge MODEL_NAME=llama3.2 streamlit run app.py
+```
+
+Or set `DOCS_FILE` when you want to index one file from the environment instead
+of using the sidebar file picker:
+
+```bash
+DOCS_FILE=./manual.pdf MODEL_NAME=llama3.2 streamlit run app.py
+```
+
+The app adds a sidebar panel with a file picker, an `Index selected file` button,
+and a `Reindex configured source` button. Reindexing reads supported files,
+splits them into overlapping chunks, embeds the chunks with `nomic-embed-text`,
+and stores them in Chroma under a separate
+`project_documents` collection. Conversation memory and document memory share the
+same local Chroma persistence directory, but use different collections. By
+default, that persistence directory is `DOCS_DIR/.OAP_RAG` when `DOCS_DIR` is
+set, or a sibling `.OAP_RAG` directory next to `DOCS_FILE` when a single file is
+used.
+
+Supported file extensions default to:
+
+```bash
+.txt,.md,.py,.json,.yaml,.yml,.toml,.ini,.cfg,.pdf
+```
+
+Useful document memory environment variables:
+
+```bash
+DOCS_DIR=./knowledge
+DOCS_FILE=./manual.pdf
+MEMORY_DIR=./knowledge/.OAP_RAG
+DOCS_RESULTS=6
+DOCS_CHUNK_SIZE=1500
+DOCS_CHUNK_OVERLAP=200
+DOCS_EXTENSIONS=.txt,.md,.py,.json,.yaml,.yml,.toml,.ini,.cfg,.pdf
+```
+
+For PDFs, the app extracts text from every page, labels chunks with page markers
+where possible, then indexes the extracted text through the same Chroma document
+memory flow.
+
+At response time, the prompt receives:
+
+1. relevant long-term conversation memory,
+2. relevant project file chunks,
+3. recent conversation,
+4. the current user question.
+
+The indexed file chunks include source path metadata, so retrieved context is
+passed to the model with source labels such as `Source: README.md chunk 0`.
