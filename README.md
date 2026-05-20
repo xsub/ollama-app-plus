@@ -1,3 +1,5 @@
+# ollama-app-plus
+
 # Download and install ollama
 https://ollama.com
 
@@ -8,6 +10,10 @@ Choose a model from the library: https://ollama.com/library
 Run it locally:
 
 ```ollama run <MODEL_NAME>```
+
+Download the local embedding model used for long-term memory:
+
+```ollama pull nomic-embed-text```
 
 # Install pip packages
 
@@ -68,3 +74,38 @@ In normal operation with streaming enabled, chunks are displayed at the model's
 native pace. The adaptive delay mostly matters for fallback replay, while the same
 measurements still provide a useful live benchmark of the selected model and
 hardware setup.
+
+# Long-term conversation memory
+
+The app can keep a local semantic memory of previous exchanges by using Chroma as
+a file-based vector database and Ollama embeddings. This lets the model retrieve
+older relevant conversation fragments without sending the whole dialog back to the
+LLM on every request.
+
+How it works:
+
+1. The current browser session keeps recent messages in Streamlit session state.
+2. Before answering a new prompt, the app embeds the user question with
+   `nomic-embed-text`.
+3. Chroma searches `./memory_db` for the most similar previous exchanges.
+4. The prompt receives three context blocks: relevant long-term memory, recent
+   conversation, and the current question.
+5. After the assistant response is complete, the user/assistant exchange is saved
+   back to Chroma for future retrieval.
+
+The memory database is stored locally in `./memory_db` and is ignored by Git.
+
+Useful environment variables:
+
+```bash
+EMBEDDING_MODEL=nomic-embed-text
+MEMORY_DIR=./memory_db
+MEMORY_RESULTS=4
+RECENT_MESSAGES_LIMIT=6
+```
+
+For example:
+
+```bash
+MODEL_NAME=llama3.2 EMBEDDING_MODEL=nomic-embed-text streamlit run app.py
+```
