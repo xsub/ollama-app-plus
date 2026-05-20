@@ -493,6 +493,7 @@ def response_generator(user_input):
 
 
 st.title(CHAT_TITLE)
+st.caption(f"Model: {OLLAMA_MODEL}")
 
 estimator = get_token_rate_estimator()
 st.caption(
