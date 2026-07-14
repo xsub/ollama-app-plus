@@ -3,7 +3,8 @@
 Local-first AI document agent with Streamlit, LangChain, Ollama and Chroma.
 It uses tool-calling RAG over PDFs, DOCX files and text documents, keeps
 long-term semantic memory, supports file masks, and can synthesize many CV/LoM
-variants into a useful portfolio-level answer.
+variants from their actual content instead of confusing filenames with career
+history.
 
 `Ollama DocPilot` is a practical playground for building an agentic RAG assistant
 that runs locally. It combines a Streamlit chat interface, LangChain tool
@@ -13,9 +14,9 @@ instead of answering from model memory.
 
 The project is designed as a compact but ambitious reference implementation of
 modern AI agent architecture: local LLM inference, vector search, tool calling,
-ReAct-style decision flow, document ingestion, filename-aware metadata retrieval,
-stateful conversation memory, and a UI that makes indexing and retrieval visible
-while they run.
+ReAct-style decision flow, document ingestion, application-target metadata
+retrieval, stateful conversation memory, and a UI that makes indexing and
+retrieval visible while they run.
 
 ## Technology stack
 
@@ -24,6 +25,8 @@ while they run.
 - Ollama for local model serving and private on-machine inference.
 - LangChain and LangChain Ollama for prompt composition, streaming responses,
   chat model integration, tool binding, and agent-style control flow.
+- LangGraph for the explicit response workflow: intent routing, tool execution,
+  fallback paths, and evidence-gated CV career synthesis.
 - ChromaDB via `langchain-chroma` for persistent local vector storage.
 - Ollama embeddings with `nomic-embed-text` for semantic document and memory
   retrieval.
@@ -40,10 +43,11 @@ while they run.
 - Multi-file document upload and directory indexing.
 - Glob-style file masks such as `*.pdf`, `*.docx`, or `reports/**/*.pdf`.
 - Agent tools for local document search and document-index status.
-- Metadata-aware retrieval that treats filenames as evidence for questions about
-  CVs, applications, roles, companies, and dates.
-- Deterministic CV portfolio summaries that group many indexed CV/LoM variants
-  by role, company/target hints, recency, and positioning.
+- LangGraph-based response routing instead of one large conditional chain.
+- Metadata-aware retrieval that treats filenames as evidence only for questions
+  about application targets, not employment history.
+- Content-based CV career synthesis that ignores filename metadata and summarizes
+  real experience from indexed PDF/DOCX text chunks.
 - Live indexing progress, including current file, total file count, and
   percentage.
 - Per-response copy buttons in the chat UI.
@@ -239,7 +243,9 @@ memory flow. For DOCX files, the app extracts text directly from the Office Open
 XML document body, headers, and footers. Every indexed file also gets a metadata
 chunk containing the source path and a readable version of the filename, so names
 like `Pawel_Suchanecki_CV_VyOS_Development_Manager_2026-07.pdf` can be used as
-evidence when the user asks about the indexed CV, target company, role, or date.
+evidence when the user asks where a CV was sent, which target role was used, or
+which application date is encoded in the file name. Filename metadata is not
+used as evidence of employment history.
 Reindex existing documents after upgrading to create these filename metadata
 chunks.
 
@@ -253,21 +259,69 @@ parser internals.
 
 The app now exposes the document retriever as an agent tool named
 `search_local_documents` and a status tool named `get_document_index_status`.
-Instead of always injecting document context into every prompt, the chat flow
-first asks a tool-capable Ollama chat model whether it needs local files to
-answer the current question.
+Instead of always injecting document context into every prompt, a LangGraph
+workflow first routes the question to the right path, then either answers from
+metadata, runs evidence-gated CV synthesis, or asks a tool-capable Ollama chat
+model whether it needs local files.
+
+```mermaid
+flowchart TD
+    A["User question"] --> B["LangGraph: classify_intent"]
+
+    B --> C{"Question type?"}
+
+    C -->|"Index status"| D["Read Chroma metadata"]
+    D --> D2["Return file count, chunk count, progress"]
+
+    C -->|"Recent applications / targets"| E["Use filenames only"]
+    E --> E2["Parse CV/LoM filenames"]
+    E2 --> E3["Return application targets, roles, dates"]
+
+    C -->|"Career / experience from CV"| F["Use CV content only"]
+    F --> F1["Load Chroma document records"]
+    F1 --> F2["Drop filename metadata chunks"]
+    F2 --> F3["Remove recruitment consent / GDPR clauses"]
+    F3 --> F4["Rank career-relevant chunks"]
+    F4 --> F5["Deduplicate repeated CV variants"]
+    F5 --> F6["Build evidence context"]
+    F6 --> F7["Generate career synthesis"]
+    F7 --> F8["Verify answer against evidence"]
+    F8 -->|"OK"| F9["Final answer"]
+    F8 -->|"Unsupported employer / repetition"| F10["Repair answer"]
+    F10 --> F8
+
+    C -->|"Generic document question"| G["Ollama chat model with tools"]
+    G --> H{"Tool call?"}
+    H -->|"search_local_documents"| I["Search Chroma with active sidebar mask"]
+    H -->|"get_document_index_status"| D
+    H -->|"No tool"| J["Direct model answer"]
+    I --> K["Return ToolMessage"]
+    K --> L["Final answer from tool evidence"]
+
+    G -->|"Tool calling unavailable"| M["Fallback direct RAG"]
+    M --> N["Retrieve memory + document context"]
+    N --> O["Final fallback answer"]
+```
+
+The key invariant is:
+
+```text
+Filename = where / for which role a CV was sent
+CV content = real career, experience, and competencies
+```
 
 The decision loop is:
 
 1. The user asks a question.
-2. `ChatOllama.bind_tools(...)` gives the model access to
+2. LangGraph classifies the intent and chooses the route.
+3. For generic document questions, `ChatOllama.bind_tools(...)` gives the model access to
    `search_local_documents` and `get_document_index_status`.
-3. If the model returns a tool call, the Streamlit app runs the local Chroma
+4. If the model returns a tool call, the Streamlit app runs the local Chroma
    search against indexed files from `DOCS_DIR`, `DOCS_FILE`, or uploaded
    documents. If the user asks for a file mask such as `*.pdf`, the model can
    pass it as the tool's optional `file_mask` argument.
-4. The search result is sent back as a `ToolMessage`.
-5. The model writes the final natural-language answer using the returned
+5. The search result is sent back as a `ToolMessage`.
+6. The model writes the final natural-language answer using the returned
    fragments and source labels.
 
 When `DOCS_DIR` or `DOCS_FILE` is configured, the tool auto-indexes that source
@@ -290,13 +344,16 @@ from retrieved document text.
 Questions about recent applications, such as "where did Pawel apply most
 recently and for what role?", are also handled from indexed filenames first. The
 app parses dates, company hints, and role hints from names like
-`Pawel_Suchanecki_CV_VyOS_Development_Manager_2026-07.pdf` before falling back
-to semantic document search.
+`Pawel_Suchanecki_CV_VyOS_Development_Manager_2026-07.pdf` only as application
+target metadata.
 
-Questions that ask for analysis of many CVs are handled as portfolio synthesis:
-the app groups indexed CV/LoM variants by role area, company/target hints, date
-signals, and positioning before asking the model to answer free-form questions.
-This avoids repetitive answers when many documents contain similar CV content.
+Questions that ask for career analysis, experience, competencies, or a CV
+portfolio summary are handled from content chunks only. The app drops filename
+metadata chunks, removes recruitment consent/GDPR clauses, selects
+representative non-duplicate CV text fragments, and asks the model to synthesize
+the real career from those fragments. This avoids mistaking "company I applied
+to" or "company named in a consent clause" for "company I worked for" and
+reduces repetitive answers when many CV variants share similar content.
 
 In the fallback flow, the prompt receives:
 

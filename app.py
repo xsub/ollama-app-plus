@@ -14,6 +14,7 @@ from io import BytesIO
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, TypedDict
 from xml.etree import ElementTree
 from uuid import uuid4
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -27,6 +28,12 @@ try:
     from langchain_chroma import Chroma
 except ImportError:
     Chroma = None
+
+try:
+    from langgraph.graph import END, StateGraph
+except ImportError:
+    END = None
+    StateGraph = None
 
 try:
     from pypdf import PdfReader
@@ -98,11 +105,14 @@ indeksowania.
 Jesli uzytkownik poda maske plikow, przekaz ja jako argument file_mask narzedzia.
 Maska ustawiona w sidebarze jest nadrzednym ograniczeniem i nie wolno jej
 rozszerzac szersza maska z narzedzia.
-Nazwy plikow sa czescia wiedzy: moga zawierac firme, stanowisko i date aplikacji.
+Nazwy plikow wolno traktowac jako wskazowke tylko wtedy, gdy uzytkownik pyta
+gdzie lub na jaka role wyslal CV/aplikowal. Nie wolno uzywac nazw plikow jako
+dowodu historii zatrudnienia, kariery ani prawdziwego doswiadczenia.
 Nie zgaduj danych z dokumentow. Jesli narzedzie nie znajdzie informacji,
 powiedz to jasno.
 Nie powtarzaj tych samych akapitow ani list. Przy wielu podobnych dokumentach
-zrob synteze, pogrupuj role/firmy/wnioski i podaj liczby.
+zrob synteze, pogrupuj role i wnioski. Firmy podawaj tylko wtedy, gdy wystepuja
+w tresci dokumentu, nie tylko w nazwie pliku.
 Nie opisuj procesu ani nazw narzedzi, chyba ze uzytkownik wprost o to zapyta.
 
 Relevant long-term memory:
@@ -113,11 +123,66 @@ Recent conversation:
 
 Odpowiedz na pytanie uzytkownika po polsku, chyba ze uzytkownik poprosi o inny jezyk.
 """
+CV_CAREER_PROMPT_TEMPLATE = """
+Jestes precyzyjnym analitykiem CV.
+
+Uzyj wylacznie tresci CV ponizej. Fragmenty sa celowo pozbawione nazw plikow,
+bo nazwy plikow oznaczaja targety aplikacji, a nie historie zatrudnienia.
+Fragmenty klauzul rekrutacyjnych/RODO sa usuwane przed analiza.
+
+Nazwy ponizej sa targetami aplikacji albo firmami z klauzul rekrutacyjnych.
+Nie traktuj ich jako pracodawcow, historii kariery ani dowodu doswiadczenia.
+Najlepiej nie wymieniaj ich wcale, chyba ze uzytkownik pyta o aplikacje:
+{application_only_targets}
+
+Zasady:
+- Nie twierdz, ze kandydat pracowal w firmie, jesli ta firma nie wystepuje w
+  tresci CV w kontekscie doswiadczenia zawodowego.
+- Nie uzywaj firm ani rol z nazw plikow jako kariery.
+- Nie uzywaj firm z klauzul o przetwarzaniu danych osobowych jako kariery.
+- Polacz powtarzajace sie fakty z wielu wariantow CV w jedna synteze.
+- Nie powtarzaj tych samych akapitow.
+- Jesli czegos nie da sie ustalic z tresci CV, napisz to jasno.
+
+Pytanie uzytkownika:
+{question}
+
+Tresc CV:
+{cv_context}
+
+Odpowiedz po polsku, zwiezle i konkretnie. Uzyj struktury:
+1. Profil kariery
+2. Glowna os czasu / typy rol
+3. Najmocniejsze kompetencje
+4. Co wynika z wielu wariantow CV
+5. Ograniczenia danych, jesli sa
+"""
+CV_CAREER_REPAIR_PROMPT_TEMPLATE = """
+Poprzednia odpowiedz naruszyla zasady evidence-gating.
+
+Problem:
+{verification_notes}
+
+Napisz poprawiona odpowiedz od zera. Uzyj wylacznie tresci CV ponizej.
+Nie wymieniaj targetow aplikacji ani firm z klauzul rekrutacyjnych jako
+pracodawcow:
+{application_only_targets}
+
+Pytanie uzytkownika:
+{question}
+
+Tresc CV:
+{cv_context}
+
+Poprawiona odpowiedz po polsku:
+"""
 CHAT_TITLE = "Ollama DocPilot"
 CHAT_HINT = "Co tam?"
 DEFAULT_TOKEN_RATE = 20.0
 MIN_TOKEN_DELAY_SECONDS = 0.005
 MAX_TOKEN_DELAY_SECONDS = 0.2
+CV_CAREER_CONTEXT_CHARS = int(os.getenv("CV_CAREER_CONTEXT_CHARS", "14000"))
+CV_CAREER_CONTEXT_CHUNKS = int(os.getenv("CV_CAREER_CONTEXT_CHUNKS", "14"))
 
 
 @dataclass
@@ -335,7 +400,7 @@ def retrieve_document_context(user_input: str, file_mask: str | None = None) -> 
     return "\n\n".join(formatted_docs)
 
 
-def get_document_collection_metadatas() -> list[dict]:
+def get_document_collection_records(include_documents: bool = False) -> list[dict]:
     document_store = get_document_store()
     if document_store is None:
         return []
@@ -344,16 +409,42 @@ def get_document_collection_metadatas() -> list[dict]:
     if collection is None:
         return []
 
+    include = ["metadatas"]
+    if include_documents:
+        include.append("documents")
+
     try:
-        collection_data = collection.get(include=["metadatas"])
+        collection_data = collection.get(include=include)
     except Exception as exc:
         st.session_state.document_status = f"Could not read document index: {exc}"
         return []
 
+    ids = collection_data.get("ids", [])
+    metadatas = collection_data.get("metadatas", [])
+    documents = collection_data.get("documents", []) if include_documents else []
+    records = []
+
+    for index, metadata in enumerate(metadatas):
+        if not metadata or not metadata.get("source_path"):
+            continue
+
+        records.append(
+            {
+                "id": ids[index] if index < len(ids) else "",
+                "metadata": metadata,
+                "content": documents[index]
+                if include_documents and index < len(documents)
+                else "",
+            }
+        )
+
+    return records
+
+
+def get_document_collection_metadatas() -> list[dict]:
     return [
-        metadata
-        for metadata in collection_data.get("metadatas", [])
-        if metadata and metadata.get("source_path")
+        record["metadata"]
+        for record in get_document_collection_records()
     ]
 
 
@@ -593,6 +684,41 @@ CV_ROLE_GROUPS = [
     ),
 ]
 
+TARGET_HINT_STOPWORDS = {
+    "senior",
+    "sr",
+    "scrum",
+    "master",
+    "safe",
+    "technical",
+    "agile",
+    "delivery",
+    "lead",
+    "coach",
+    "manager",
+    "management",
+    "engineering",
+    "engineer",
+    "hands",
+    "on",
+    "ai",
+    "assisted",
+    "deep",
+    "product",
+    "owner",
+    "program",
+    "project",
+    "development",
+    "software",
+    "backend",
+    "platform",
+    "linux",
+    "embedded",
+    "remote",
+    "hybrid",
+    "role",
+}
+
 
 def normalize_for_matching(text: str) -> str:
     normalized = text.lower()
@@ -681,17 +807,65 @@ def is_recent_application_question(user_input: str) -> bool:
     mentions_application = (
         "aplikow" in normalized
         or "wyslal cv" in normalized
-        or "cv" in normalized
+        or "wyslane cv" in normalized
+        or "wysylalem cv" in normalized
+        or (
+            "cv" in normalized
+            and (
+                "wyslal" in normalized
+                or "wyslane" in normalized
+                or "wysylalem" in normalized
+            )
+        )
     )
     asks_recent = "ostatnio" in normalized or "najnowsz" in normalized
     asks_target = "gdzie" in normalized or "rola" in normalized or "role" in normalized
     return mentions_application and asks_recent and asks_target
 
 
+def is_application_targets_question(user_input: str) -> bool:
+    normalized = normalize_for_matching(user_input)
+    mentions_application = (
+        "aplikow" in normalized
+        or "wyslal cv" in normalized
+        or "wyslane cv" in normalized
+        or "target" in normalized
+    )
+    asks_targets = any(
+        phrase in normalized
+        for phrase in (
+            "gdzie",
+            "firma",
+            "firmy",
+            "rola",
+            "role",
+            "stanow",
+            "target",
+            "do kogo",
+        )
+    )
+    return mentions_application and asks_targets
+
+
 def is_cv_portfolio_question(user_input: str) -> bool:
+    if is_application_targets_question(user_input):
+        return False
+
     normalized = normalize_for_matching(user_input)
     mentions_cv = bool(
         re.search(r"\b(?:cv|cvs|resume|resumes|lom|loms)\b", normalized)
+    )
+    mentions_career = any(
+        phrase in normalized
+        for phrase in (
+            "karier",
+            "doswiadcz",
+            "profil zawod",
+            "histori zawod",
+            "prawdziw",
+            "realn",
+            "kompetenc",
+        )
     )
     asks_analysis = any(
         phrase in normalized
@@ -703,18 +877,23 @@ def is_cv_portfolio_question(user_input: str) -> bool:
             "kompetenc",
             "profil",
             "wniosk",
+            "karier",
+            "histori",
+            "pracow",
+            "prawdziw",
+            "realn",
+            "zawod",
+            "umiejet",
+            "skill",
             "role",
             "stanow",
-            "aplik",
-            "gdzie",
-            "jakie",
             "wiele",
             "wszyst",
             "zindeks",
             "kolekc",
         )
     )
-    return mentions_cv and asks_analysis
+    return (mentions_cv or mentions_career) and asks_analysis
 
 
 def categorize_application_record(record: dict) -> str:
@@ -765,7 +944,7 @@ def format_counter_lines(counter: Counter, total: int, limit: int = 7) -> list[s
     return lines
 
 
-def format_cv_portfolio_response(records: list[dict], snapshot: dict) -> str:
+def format_application_targets_response(records: list[dict], snapshot: dict) -> str:
     if not records:
         return (
             "Nie znalazlem zindeksowanych plikow CV/LoM pasujacych do aktywnej maski."
@@ -796,23 +975,15 @@ def format_cv_portfolio_response(records: list[dict], snapshot: dict) -> str:
 
     lines = [
         (
-            f"Przejrzalem {total} zindeksowanych plikow CV/LoM "
+            f"Przejrzalem nazwy {total} zindeksowanych plikow CV/LoM "
             f"pasujacych do aktywnej maski ({snapshot['chunk_count']} chunkow). "
-            "Ponizej jest synteza z kolekcji, a nie powielenie podobnych fragmentow."
+            "Traktuje je jako targety aplikacji, nie jako historie kariery."
         ),
         "",
-        "Najmocniejszy obraz profilu:",
+        "Najczestsze kierunki aplikacji z nazw plikow:",
         f"- Dominujace kierunki: {top_roles}.",
-        (
-            "- Portfolio wyglada na celowo wariantowane pod role managerskie, "
-            "agile/delivery i techniczne, zamiast jednego generycznego CV."
-        ),
-        (
-            "- Najbardziej czytelny positioning: Engineering Manager / Technical "
-            "Lead z mocnym tlem Scrum Master, Agile Delivery i platform engineering."
-        ),
         "",
-        "Rozklad rol i obszarow z nazw plikow:",
+        "Rozklad targetow/obszarow z nazw plikow:",
     ]
     lines.extend(format_counter_lines(role_counter, total))
 
@@ -837,15 +1008,501 @@ def format_cv_portfolio_response(records: list[dict], snapshot: dict) -> str:
         [
             "",
             (
-                "Wniosek: zamiast odpowiadac ogolnie, ze Pawel jest Scrum Masterem "
-                "albo Python developerem, lepsza odpowiedz powinna pokazac miks: "
-                "technical leadership, engineering management, Agile delivery oraz "
-                "platform/Linux/backend context."
+                "Uwaga: ta odpowiedz mowi o targetach aplikacji z nazw plikow. "
+                "Do pytan o prawdziwa kariere trzeba analizowac tresc CV, nie nazwy."
             ),
         ]
     )
 
     return "\n".join(lines)
+
+
+CAREER_CHUNK_KEYWORDS = {
+    "experience": 5,
+    "professional experience": 6,
+    "work experience": 6,
+    "employment": 5,
+    "career": 4,
+    "summary": 2,
+    "profile": 2,
+    "scrum master": 5,
+    "agile": 4,
+    "delivery lead": 5,
+    "product owner": 4,
+    "product manager": 4,
+    "engineering manager": 5,
+    "development manager": 5,
+    "software engineer": 4,
+    "python": 3,
+    "linux": 3,
+    "embedded": 3,
+    "platform": 3,
+    "firmware": 3,
+    "developer": 3,
+    "architect": 3,
+    "consultant": 3,
+    "manager": 3,
+    "lead": 2,
+    "certified": 2,
+    "certification": 2,
+    "doswiadczenie": 5,
+    "kariera": 4,
+    "zatrudnienie": 5,
+    "kompetencje": 3,
+    "umiejetnosci": 3,
+}
+
+RECRUITMENT_CONSENT_MARKERS = (
+    "zgoda",
+    "wyrazam zgode",
+    "dane osobowe",
+    "przetwarz",
+    "rodo",
+    "gdpr",
+    "privacy",
+    "rekrutac",
+    "recruitment",
+    "recruiting",
+    "application process",
+    "future recruitment",
+    "administrator danych",
+)
+
+EMPLOYMENT_CONTEXT_MARKERS = (
+    "experience",
+    "professional experience",
+    "work experience",
+    "employment",
+    "worked",
+    "role",
+    "career",
+    "company",
+    "doswiadczenie",
+    "kariera",
+    "zatrudnienie",
+    "pracow",
+    "stanowisko",
+    "rola",
+    "firmie",
+)
+
+EMPLOYMENT_CLAIM_MARKERS = (
+    "pracowal",
+    "pracowalem",
+    "pracowala",
+    "zatrudnion",
+    "doswiadczenie w firm",
+    "role w firm",
+    "role w firmach",
+    "w firmach takich jak",
+    "worked at",
+    "worked for",
+    "employed by",
+    "experience at",
+    "roles at",
+)
+
+
+def get_cv_content_records(file_mask: str | None = None) -> list[dict]:
+    masks = parse_file_masks(file_mask)
+    records = []
+
+    for record in get_document_collection_records(include_documents=True):
+        metadata = record["metadata"]
+        source_path = metadata.get("source_path", "")
+        content = record.get("content", "") or ""
+
+        if file_mask and not matches_source_path(source_path, masks):
+            continue
+        if not is_application_source_path(source_path):
+            continue
+        if metadata.get("chunk_kind") == "metadata":
+            continue
+        if not content.strip():
+            continue
+
+        records.append(record)
+
+    return records
+
+
+def is_recruitment_consent_text(text: str) -> bool:
+    normalized = normalize_for_matching(text)
+    return any(marker in normalized for marker in RECRUITMENT_CONSENT_MARKERS)
+
+
+def sanitize_cv_career_content(content: str) -> str:
+    normalized_content = content.replace("\r", "\n")
+    parts = re.split(r"(?<=[.!?])\s+|\n+", normalized_content)
+    kept_parts = []
+
+    for part in parts:
+        stripped = part.strip()
+        if not stripped:
+            continue
+        if is_recruitment_consent_text(stripped):
+            continue
+        kept_parts.append(stripped)
+
+    return "\n".join(kept_parts)
+
+
+def unique_preserve_order(values: list[str]) -> list[str]:
+    seen = set()
+    unique = []
+
+    for value in values:
+        cleaned = " ".join(value.split()).strip(" -_,.;:")
+        fingerprint = normalize_for_matching(cleaned)
+        if not cleaned or len(fingerprint) < 3 or fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        unique.append(cleaned)
+
+    return unique
+
+
+def application_target_names_from_records(records: list[dict]) -> list[str]:
+    candidates = []
+    for record in records:
+        candidates.append(application_target_hint_for_record(record))
+
+    return unique_preserve_order(candidates)
+
+
+def application_target_hint_for_record(record: dict) -> str:
+    company = clean_company_hint(record.get("company", ""))
+    if company:
+        return company
+
+    title = record.get("title", "")
+    role = record.get("role", "")
+    candidate = title
+    for role_pattern in sorted(
+        {pattern for _, patterns in CV_ROLE_GROUPS for pattern in patterns},
+        key=len,
+        reverse=True,
+    ):
+        candidate = re.sub(re.escape(role_pattern), " ", candidate, flags=re.I)
+
+    if role and role != title:
+        candidate = candidate.replace(role, " ")
+
+    words = []
+    for word in re.split(r"[^A-Za-z0-9+.]+", candidate):
+        cleaned = word.strip(" ._+-")
+        if not cleaned:
+            continue
+        if normalize_for_matching(cleaned) in TARGET_HINT_STOPWORDS:
+            continue
+        words.append(cleaned)
+
+    if words:
+        return " ".join(words[-4:])
+
+    return company_hint_for_record(record)
+
+
+def contains_employment_context_for_target(target: str, chunks: list[str]) -> bool:
+    target_fingerprint = normalize_for_matching(target)
+    if not target_fingerprint:
+        return False
+
+    for chunk in chunks:
+        normalized_chunk = normalize_for_matching(chunk)
+        if target_fingerprint not in normalized_chunk:
+            continue
+        if any(marker in normalized_chunk for marker in EMPLOYMENT_CONTEXT_MARKERS):
+            return True
+
+    return False
+
+
+def application_only_targets(file_mask: str | None, chunks: list[str]) -> list[str]:
+    snapshot = get_document_index_snapshot(file_mask)
+    records = application_records_from_snapshot(snapshot)
+    targets = application_target_names_from_records(records)
+    return [
+        target
+        for target in targets
+        if not contains_employment_context_for_target(target, chunks)
+    ]
+
+
+def format_application_only_targets(targets: list[str]) -> str:
+    if not targets:
+        return "- brak wykrytych targetow aplikacji spoza tresci kariery"
+
+    return "\n".join(f"- {target}" for target in targets[:30])
+
+
+def career_chunk_score(content: str) -> int:
+    normalized = normalize_for_matching(content)
+    score = 0
+
+    for keyword, weight in CAREER_CHUNK_KEYWORDS.items():
+        if keyword in normalized:
+            score += weight
+
+    score += min(6, len(re.findall(r"\b(?:19|20)\d{2}\b", content)))
+    if len(content) > 500:
+        score += 2
+    if len(content) > 1000:
+        score += 2
+
+    return score
+
+
+def token_set_for_similarity(text: str) -> set[str]:
+    words = normalize_for_matching(text).split()
+    return set(words[:220])
+
+
+def is_near_duplicate_chunk(tokens: set[str], selected_tokens: list[set[str]]) -> bool:
+    if not tokens:
+        return True
+
+    for previous_tokens in selected_tokens:
+        overlap = len(tokens & previous_tokens)
+        denominator = max(1, min(len(tokens), len(previous_tokens)))
+        if overlap / denominator >= 0.86:
+            return True
+
+    return False
+
+
+def select_cv_career_chunks(file_mask: str | None = None) -> tuple[list[str], int]:
+    records = get_cv_content_records(file_mask)
+    scored_records = sorted(
+        (
+            (
+                career_chunk_score(
+                    sanitize_cv_career_content(record.get("content", "") or "")
+                ),
+                record,
+            )
+            for record in records
+        ),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    selected_chunks = []
+    selected_tokens = []
+    used_chars = 0
+
+    for score, record in scored_records:
+        content = re.sub(
+            r"\s+",
+            " ",
+            sanitize_cv_career_content(record.get("content", "") or ""),
+        ).strip()
+        if score <= 0 or len(content) < 120:
+            continue
+
+        tokens = token_set_for_similarity(content)
+        if is_near_duplicate_chunk(tokens, selected_tokens):
+            continue
+
+        remaining_chars = CV_CAREER_CONTEXT_CHARS - used_chars
+        if remaining_chars <= 0:
+            break
+
+        chunk = content[:remaining_chars]
+        selected_chunks.append(chunk)
+        selected_tokens.append(tokens)
+        used_chars += len(chunk)
+
+        if len(selected_chunks) >= CV_CAREER_CONTEXT_CHUNKS:
+            break
+
+    return selected_chunks, len(records)
+
+
+def format_cv_career_context(chunks: list[str]) -> str:
+    return "\n\n".join(
+        f"[CV content chunk {index}]\n{chunk}"
+        for index, chunk in enumerate(chunks, start=1)
+    )
+
+
+def remove_repeated_paragraphs(text: str) -> str:
+    paragraphs = re.split(r"\n\s*\n", text.strip())
+    seen = set()
+    unique = []
+
+    for paragraph in paragraphs:
+        fingerprint = " ".join(normalize_for_matching(paragraph).split()[:80])
+        if not fingerprint:
+            continue
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        unique.append(paragraph.strip())
+
+    return "\n\n".join(unique)
+
+
+def sentence_mentions_target(sentence: str, target: str) -> bool:
+    normalized_sentence = normalize_for_matching(sentence)
+    normalized_target = normalize_for_matching(target)
+    return bool(normalized_target and normalized_target in normalized_sentence)
+
+
+def sentence_has_employment_claim(sentence: str) -> bool:
+    normalized = normalize_for_matching(sentence)
+    return any(marker in normalized for marker in EMPLOYMENT_CLAIM_MARKERS)
+
+
+def sentence_marks_target_as_application_only(sentence: str) -> bool:
+    normalized = normalize_for_matching(sentence)
+    return (
+        "target" in normalized
+        or "aplik" in normalized
+        or "wyslal" in normalized
+        or "wyslane" in normalized
+        or "nie prac" in normalized
+        or "nie jest pracodawca" in normalized
+    )
+
+
+def verify_cv_career_answer(answer: str, application_targets: list[str]) -> list[str]:
+    notes = []
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", answer)
+
+    for target in application_targets:
+        for sentence in sentences:
+            if not sentence_mentions_target(sentence, target):
+                continue
+            if sentence_marks_target_as_application_only(sentence):
+                continue
+            if sentence_has_employment_claim(sentence):
+                notes.append(
+                    (
+                        f"'{target}' wyglada na uzyte jako pracodawca lub firma "
+                        "kariery, ale jest tylko targetem aplikacji/klauzuli."
+                    )
+                )
+                break
+
+    normalized_paragraphs = [
+        " ".join(normalize_for_matching(paragraph).split()[:80])
+        for paragraph in re.split(r"\n\s*\n", answer.strip())
+        if paragraph.strip()
+    ]
+    repeated = len(normalized_paragraphs) - len(set(normalized_paragraphs))
+    if repeated > 0:
+        notes.append(f"Odpowiedz zawiera {repeated} powtorzone akapity.")
+
+    return notes
+
+
+def repair_cv_career_response(
+    user_input: str,
+    chunks: list[str],
+    application_targets: list[str],
+    verification_notes: list[str],
+) -> str:
+    prompt = ChatPromptTemplate.from_template(CV_CAREER_REPAIR_PROMPT_TEMPLATE)
+    model = OllamaLLM(model=OLLAMA_MODEL)
+    chain = prompt | model | StrOutputParser()
+    chain_input = {
+        "question": user_input,
+        "cv_context": format_cv_career_context(chunks),
+        "application_only_targets": format_application_only_targets(
+            application_targets
+        ),
+        "verification_notes": "\n".join(f"- {note}" for note in verification_notes),
+    }
+
+    try:
+        return remove_repeated_paragraphs(chain.invoke(chain_input))
+    except Exception as exc:
+        st.session_state.document_status = f"CV career repair unavailable: {exc}"
+        return ""
+
+
+def format_cv_career_fallback(chunks: list[str], total_chunks: int) -> str:
+    lines = [
+        (
+            f"Znalazlem {total_chunks} fragmentow tresci CV i wybralem "
+            f"{len(chunks)} najbardziej relewantnych, ale model nie zwrocil "
+            "pelnej syntezy."
+        ),
+        "",
+        "Najbardziej uzyteczne fragmenty tresci CV:",
+    ]
+
+    for index, chunk in enumerate(chunks[:5], start=1):
+        excerpt = chunk[:500].strip()
+        if len(chunk) > 500:
+            excerpt += "..."
+        lines.append(f"- Fragment {index}: {excerpt}")
+
+    return "\n".join(lines)
+
+
+def generate_cv_career_response(user_input: str, file_mask: str | None = None) -> str:
+    chunks, total_chunks = select_cv_career_chunks(file_mask)
+    if not chunks:
+        st.session_state.career_graph_status = (
+            "Career synthesis: no CV content chunks after filtering metadata/consent."
+        )
+        return (
+            "Nie znalazlem tresci CV pasujacej do aktywnej maski. "
+            "Widze co najwyzej metadane albo nazwy plikow, a tych nie uzywam "
+            "do opisu prawdziwej kariery."
+        )
+
+    targets = application_only_targets(file_mask, chunks)
+    prompt = ChatPromptTemplate.from_template(CV_CAREER_PROMPT_TEMPLATE)
+    model = OllamaLLM(model=OLLAMA_MODEL)
+    chain = prompt | model | StrOutputParser()
+    chain_input = {
+        "question": user_input,
+        "cv_context": format_cv_career_context(chunks),
+        "application_only_targets": format_application_only_targets(targets),
+    }
+
+    try:
+        response = chain.invoke(chain_input)
+    except Exception as exc:
+        st.session_state.document_status = f"CV career synthesis unavailable: {exc}"
+        st.session_state.career_graph_status = (
+            f"Career synthesis fallback: {len(chunks)} of {total_chunks} chunks."
+        )
+        return format_cv_career_fallback(chunks, total_chunks)
+
+    response = remove_repeated_paragraphs(response)
+    if not response:
+        st.session_state.career_graph_status = (
+            f"Career synthesis fallback: {len(chunks)} of {total_chunks} chunks."
+        )
+        return format_cv_career_fallback(chunks, total_chunks)
+
+    verification_notes = verify_cv_career_answer(response, targets)
+    repair_attempted = False
+    if verification_notes:
+        repaired_response = repair_cv_career_response(
+            user_input,
+            chunks,
+            targets,
+            verification_notes,
+        )
+        if repaired_response:
+            response = repaired_response
+            repair_attempted = True
+
+    remaining_notes = verify_cv_career_answer(response, targets)
+    st.session_state.career_graph_status = (
+        "Career synthesis: "
+        f"{len(chunks)} of {total_chunks} content chunks, "
+        f"{len(targets)} application-only targets, "
+        f"repair={'yes' if repair_attempted else 'no'}, "
+        f"verification={'passed' if not remaining_notes else 'warnings'}"
+    )
+
+    return response
 
 
 def format_recent_applications_response(records: list[dict]) -> str:
@@ -1725,6 +2382,19 @@ def build_agent_messages(user_input: str):
     ]
 
 
+def invoke_fallback_response(user_input: str) -> str:
+    prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+    model = OllamaLLM(model=OLLAMA_MODEL)
+    chain = prompt | model | StrOutputParser()
+    chain_input = {
+        "memory_context": retrieve_memory_context(user_input),
+        "document_context": retrieve_document_context(user_input),
+        "recent_conversation": format_recent_conversation(),
+        "question": user_input,
+    }
+    return chain.invoke(chain_input)
+
+
 def fallback_response_generator(user_input: str, estimator: TokenRateEstimator):
     prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
     model = OllamaLLM(model=OLLAMA_MODEL)
@@ -1764,72 +2434,230 @@ def fallback_response_generator(user_input: str, estimator: TokenRateEstimator):
     yield from replay_text(response, estimator)
 
 
-def response_generator(user_input):
-    estimator = get_token_rate_estimator()
+class ResponseGraphState(TypedDict, total=False):
+    user_input: str
+    file_mask: str
+    intent: str
+    response: str
+    messages: list[Any]
+    decision_message: Any
+    tool_calls: list[Any]
+    tool_messages: list[Any]
+    error: str
+
+
+def classify_response_intent(state: ResponseGraphState) -> ResponseGraphState:
+    user_input = state["user_input"]
 
     if is_recent_application_question(user_input):
-        response = format_recent_applications_response(
-            get_recent_application_records(get_active_file_mask())
-        )
-        estimator.update(estimate_token_count(response), 1)
-        yield from replay_text(response, estimator)
-        return
+        intent = "recent_applications"
+    elif is_application_targets_question(user_input):
+        intent = "application_targets"
+    elif is_index_status_question(user_input):
+        intent = "index_status"
+    elif is_cv_portfolio_question(user_input):
+        intent = "cv_career"
+    else:
+        intent = "agentic_document"
 
-    if is_index_status_question(user_input):
-        response = format_document_index_snapshot(
-            get_document_index_snapshot(get_active_file_mask())
-        )
-        estimator.update(estimate_token_count(response), 1)
-        yield from replay_text(response, estimator)
-        return
+    st.session_state.response_graph_status = f"LangGraph intent: {intent}"
+    return {"intent": intent}
 
-    if is_cv_portfolio_question(user_input):
-        snapshot = get_document_index_snapshot(get_active_file_mask())
-        response = format_cv_portfolio_response(
+
+def route_by_intent(state: ResponseGraphState) -> str:
+    return state.get("intent", "agentic_document")
+
+
+def answer_recent_applications_node(
+    state: ResponseGraphState,
+) -> ResponseGraphState:
+    return {
+        "response": format_recent_applications_response(
+            get_recent_application_records(state.get("file_mask", ""))
+        )
+    }
+
+
+def answer_application_targets_node(
+    state: ResponseGraphState,
+) -> ResponseGraphState:
+    snapshot = get_document_index_snapshot(state.get("file_mask", ""))
+    return {
+        "response": format_application_targets_response(
             application_records_from_snapshot(snapshot),
             snapshot,
         )
-        estimator.update(estimate_token_count(response), 1)
-        yield from replay_text(response, estimator)
-        return
+    }
 
+
+def answer_index_status_node(state: ResponseGraphState) -> ResponseGraphState:
+    return {
+        "response": format_document_index_snapshot(
+            get_document_index_snapshot(state.get("file_mask", ""))
+        )
+    }
+
+
+def answer_cv_career_node(state: ResponseGraphState) -> ResponseGraphState:
+    return {
+        "response": generate_cv_career_response(
+            state["user_input"],
+            state.get("file_mask", ""),
+        )
+    }
+
+
+def agent_decide_node(state: ResponseGraphState) -> ResponseGraphState:
     try:
         model = ChatOllama(model=OLLAMA_MODEL, temperature=0)
         model_with_tools = model.bind_tools(DOCUMENT_TOOLS)
-        messages = build_agent_messages(user_input)
-
-        decision_started_at = time.perf_counter()
+        messages = build_agent_messages(state["user_input"])
         decision_message = model_with_tools.invoke(messages)
-        decision_elapsed = time.perf_counter() - decision_started_at
         tool_calls = getattr(decision_message, "tool_calls", []) or []
 
-        if tool_calls:
-            st.session_state.last_tool_calls = [
-                {
-                    "name": tool_call_value(tool_call, "name", "unknown"),
-                    "args": describe_args_for_tool(
-                        tool_call_value(tool_call, "name", "unknown"),
-                        tool_call_value(tool_call, "args", {}),
-                        user_input,
-                    ),
-                }
-                for tool_call in tool_calls
-            ]
-            tool_messages = [
-                run_tool_call(tool_call, user_input) for tool_call in tool_calls
-            ]
-            final_messages = messages + [decision_message] + tool_messages
-            yield from stream_chat_response(model, final_messages, estimator)
-            return
-
-        response = extract_message_text(decision_message)
-        estimator.update(estimate_token_count(response), decision_elapsed)
-        yield from replay_text(response, estimator)
+        return {
+            "messages": messages,
+            "decision_message": decision_message,
+            "tool_calls": tool_calls,
+            "response": extract_message_text(decision_message) if not tool_calls else "",
+        }
     except Exception as exc:
-        st.session_state.document_status = (
-            f"Agent tool calling unavailable: {exc}. Falling back to direct RAG."
+        return {"error": str(exc)}
+
+
+def route_after_agent_decision(state: ResponseGraphState) -> str:
+    if state.get("error"):
+        return "fallback"
+    if state.get("tool_calls"):
+        return "tools"
+    return "direct"
+
+
+def run_agent_tools_node(state: ResponseGraphState) -> ResponseGraphState:
+    tool_calls = state.get("tool_calls", [])
+    user_input = state["user_input"]
+    st.session_state.last_tool_calls = [
+        {
+            "name": tool_call_value(tool_call, "name", "unknown"),
+            "args": describe_args_for_tool(
+                tool_call_value(tool_call, "name", "unknown"),
+                tool_call_value(tool_call, "args", {}),
+                user_input,
+            ),
+        }
+        for tool_call in tool_calls
+    ]
+    return {
+        "tool_messages": [
+            run_tool_call(tool_call, user_input) for tool_call in tool_calls
+        ]
+    }
+
+
+def synthesize_tool_answer_node(state: ResponseGraphState) -> ResponseGraphState:
+    try:
+        model = ChatOllama(model=OLLAMA_MODEL, temperature=0)
+        final_messages = (
+            state.get("messages", [])
+            + [state.get("decision_message")]
+            + state.get("tool_messages", [])
         )
-        yield from fallback_response_generator(user_input, estimator)
+        response_message = model.invoke(final_messages)
+        return {"response": extract_message_text(response_message)}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def fallback_answer_node(state: ResponseGraphState) -> ResponseGraphState:
+    if state.get("error"):
+        st.session_state.document_status = (
+            f"Agent graph node failed: {state['error']}. Falling back to direct RAG."
+        )
+
+    try:
+        return {"response": invoke_fallback_response(state["user_input"])}
+    except Exception as exc:
+        return {"response": f"Nie udalo sie wygenerowac odpowiedzi: {exc}"}
+
+
+def get_response_graph():
+    if StateGraph is None:
+        return None
+
+    if "response_graph" in st.session_state:
+        return st.session_state.response_graph
+
+    graph = StateGraph(ResponseGraphState)
+    graph.add_node("classify_intent", classify_response_intent)
+    graph.add_node("recent_applications", answer_recent_applications_node)
+    graph.add_node("application_targets", answer_application_targets_node)
+    graph.add_node("index_status", answer_index_status_node)
+    graph.add_node("cv_career", answer_cv_career_node)
+    graph.add_node("agent_decide", agent_decide_node)
+    graph.add_node("run_tools", run_agent_tools_node)
+    graph.add_node("synthesize_tool_answer", synthesize_tool_answer_node)
+    graph.add_node("fallback", fallback_answer_node)
+
+    graph.set_entry_point("classify_intent")
+    graph.add_conditional_edges(
+        "classify_intent",
+        route_by_intent,
+        {
+            "recent_applications": "recent_applications",
+            "application_targets": "application_targets",
+            "index_status": "index_status",
+            "cv_career": "cv_career",
+            "agentic_document": "agent_decide",
+        },
+    )
+    graph.add_conditional_edges(
+        "agent_decide",
+        route_after_agent_decision,
+        {
+            "tools": "run_tools",
+            "direct": END,
+            "fallback": "fallback",
+        },
+    )
+    graph.add_edge("run_tools", "synthesize_tool_answer")
+    graph.add_conditional_edges(
+        "synthesize_tool_answer",
+        lambda state: "fallback" if state.get("error") else "done",
+        {"fallback": "fallback", "done": END},
+    )
+    graph.add_edge("recent_applications", END)
+    graph.add_edge("application_targets", END)
+    graph.add_edge("index_status", END)
+    graph.add_edge("cv_career", END)
+    graph.add_edge("fallback", END)
+
+    st.session_state.response_graph = graph.compile()
+    return st.session_state.response_graph
+
+
+def invoke_response_graph(user_input: str) -> str:
+    graph = get_response_graph()
+    if graph is None:
+        st.session_state.response_graph_status = (
+            "LangGraph unavailable: install langgraph from requirements.txt."
+        )
+        return invoke_fallback_response(user_input)
+
+    initial_state: ResponseGraphState = {
+        "user_input": user_input,
+        "file_mask": get_active_file_mask(),
+    }
+    final_state = graph.invoke(initial_state)
+    return final_state.get("response", "")
+
+
+def response_generator(user_input):
+    estimator = get_token_rate_estimator()
+    response_started_at = time.perf_counter()
+    response = invoke_response_graph(user_input)
+    response_elapsed = time.perf_counter() - response_started_at
+    estimator.update(estimate_token_count(response), response_elapsed)
+    yield from replay_text(response, estimator)
 
 
 st.title(CHAT_TITLE)
@@ -1892,6 +2720,12 @@ with st.sidebar:
     st.caption(f"Extensions: {', '.join(sorted(DOCS_EXTENSIONS))}")
     st.caption(f"Results: {DOCS_RESULTS}")
     st.caption("Agent tools: search_local_documents, get_document_index_status")
+    response_graph_status = st.session_state.get("response_graph_status")
+    if response_graph_status:
+        st.caption(response_graph_status)
+    career_graph_status = st.session_state.get("career_graph_status")
+    if career_graph_status:
+        st.caption(career_graph_status)
     last_tool_calls = st.session_state.get("last_tool_calls")
     if last_tool_calls:
         st.caption(f"Last tool call: {last_tool_calls[-1]}")
