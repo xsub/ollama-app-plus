@@ -1,14 +1,15 @@
-# streamlit-langchain-ai-agent-rag-experiment
+# Ollama DocPilot
 
-Local-first Streamlit + LangChain AI Agent RAG experiment with Ollama, Chroma,
-tool calling, local PDF/DOCX indexing, semantic document memory, and an
-observable retrieval loop.
+Local-first AI document agent with Streamlit, LangChain, Ollama and Chroma.
+It uses tool-calling RAG over PDFs, DOCX files and text documents, keeps
+long-term semantic memory, supports file masks, and can synthesize many CV/LoM
+variants into a useful portfolio-level answer.
 
-`streamlit-langchain-ai-agent-rag-experiment` is a practical playground for
-building an agentic RAG assistant that runs locally. It combines a Streamlit chat
-interface, LangChain tool binding, Ollama models and embeddings, Chroma vector
-storage, and document-aware retrieval so the assistant can decide when to search
-local files instead of answering from model memory.
+`Ollama DocPilot` is a practical playground for building an agentic RAG assistant
+that runs locally. It combines a Streamlit chat interface, LangChain tool
+binding, Ollama models and embeddings, Chroma vector storage, and
+document-aware retrieval so the assistant can decide when to search local files
+instead of answering from model memory.
 
 The project is designed as a compact but ambitious reference implementation of
 modern AI agent architecture: local LLM inference, vector search, tool calling,
@@ -41,8 +42,11 @@ while they run.
 - Agent tools for local document search and document-index status.
 - Metadata-aware retrieval that treats filenames as evidence for questions about
   CVs, applications, roles, companies, and dates.
+- Deterministic CV portfolio summaries that group many indexed CV/LoM variants
+  by role, company/target hints, recency, and positioning.
 - Live indexing progress, including current file, total file count, and
   percentage.
+- Per-response copy buttons in the chat UI.
 - Graceful fallback to direct RAG when tool calling is unavailable.
 
 # Download and install ollama
@@ -288,6 +292,11 @@ recently and for what role?", are also handled from indexed filenames first. The
 app parses dates, company hints, and role hints from names like
 `Pawel_Suchanecki_CV_VyOS_Development_Manager_2026-07.pdf` before falling back
 to semantic document search.
+
+Questions that ask for analysis of many CVs are handled as portfolio synthesis:
+the app groups indexed CV/LoM variants by role area, company/target hints, date
+signals, and positioning before asking the model to answer free-form questions.
+This avoids repetitive answers when many documents contain similar CV content.
 
 In the fallback flow, the prompt receives:
 

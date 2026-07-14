@@ -3,9 +3,12 @@ import time
 import os
 import hashlib
 import fnmatch
+import json
 import logging
 import re
 import zipfile
+import streamlit.components.v1 as components
+from collections import Counter
 from contextlib import contextmanager
 from io import BytesIO
 from dataclasses import dataclass
@@ -80,6 +83,8 @@ Current user question:
 {question}
 
 Odpowiedz na pytanie, korzystajac z pamieci i plikow tylko wtedy, gdy sa istotne.
+Nie powtarzaj tych samych akapitow ani list. Jesli masz wiele podobnych
+fragmentow, zrob synteze zamiast kopiowac podobna tresc wiele razy.
 """
 AGENT_SYSTEM_TEMPLATE = """
 Jestes pomocnym asystentem.
@@ -96,6 +101,8 @@ rozszerzac szersza maska z narzedzia.
 Nazwy plikow sa czescia wiedzy: moga zawierac firme, stanowisko i date aplikacji.
 Nie zgaduj danych z dokumentow. Jesli narzedzie nie znajdzie informacji,
 powiedz to jasno.
+Nie powtarzaj tych samych akapitow ani list. Przy wielu podobnych dokumentach
+zrob synteze, pogrupuj role/firmy/wnioski i podaj liczby.
 Nie opisuj procesu ani nazw narzedzi, chyba ze uzytkownik wprost o to zapyta.
 
 Relevant long-term memory:
@@ -106,7 +113,7 @@ Recent conversation:
 
 Odpowiedz na pytanie uzytkownika po polsku, chyba ze uzytkownik poprosi o inny jezyk.
 """
-CHAT_TITLE = "streamlit-langchain-ai-agent-rag-experiment"
+CHAT_TITLE = "Ollama DocPilot"
 CHAT_HINT = "Co tam?"
 DEFAULT_TOKEN_RATE = 20.0
 MIN_TOKEN_DELAY_SECONDS = 0.005
@@ -467,6 +474,12 @@ def strip_application_filename_noise(title: str) -> str:
 
 def split_company_and_role(title: str) -> tuple[str, str]:
     role_patterns = [
+        "hands on engineering manager",
+        "software engineering manager",
+        "engineering manager",
+        "tech lead manager",
+        "technical program manager",
+        "technical product owner",
         "senior scrum master",
         "scrum master",
         "agile delivery lead",
@@ -479,6 +492,12 @@ def split_company_and_role(title: str) -> tuple[str, str]:
         "project manager",
         "product owner",
         "product manager",
+        "program manager",
+        "team lead",
+        "lead developer",
+        "software architect",
+        "principal engineer",
+        "staff engineer",
     ]
     lowered = title.lower()
     matches = [
@@ -493,6 +512,103 @@ def split_company_and_role(title: str) -> tuple[str, str]:
     company = title[:role_start].strip(" -_")
     role = title[role_start:].strip(" -_")
     return company, role
+
+
+CV_ROLE_GROUPS = [
+    (
+        "Engineering management / tech leadership",
+        (
+            "engineering manager",
+            "software engineering manager",
+            "hands on engineering manager",
+            "tech lead manager",
+            "development manager",
+            "team lead",
+            "lead developer",
+            "technical lead",
+            "software architect",
+            "principal engineer",
+            "staff engineer",
+        ),
+    ),
+    (
+        "Scrum Master / Agile delivery",
+        (
+            "scrum master",
+            "agile delivery",
+            "delivery lead",
+            "delivery manager",
+            "safe scrum",
+            "safe product owner",
+        ),
+    ),
+    (
+        "Agile coaching / transformation",
+        (
+            "agile coach",
+            "senior agile coach",
+            "transformation",
+            "change management",
+        ),
+    ),
+    (
+        "Product ownership / product management",
+        (
+            "product owner",
+            "product manager",
+            "technical product owner",
+            "package management",
+        ),
+    ),
+    (
+        "Program / project delivery",
+        (
+            "program manager",
+            "technical program manager",
+            "project manager",
+            "delivery manager",
+        ),
+    ),
+    (
+        "Platform / Linux / embedded engineering",
+        (
+            "linux",
+            "kernel",
+            "embedded",
+            "platform",
+            "firmware",
+            "runtime",
+            "ubuntu",
+            "package management",
+        ),
+    ),
+    (
+        "Backend / Python / software engineering",
+        (
+            "backend",
+            "python",
+            "software engineer",
+            "distributed systems",
+        ),
+    ),
+]
+
+
+def normalize_for_matching(text: str) -> str:
+    normalized = text.lower()
+    normalized = (
+        normalized.replace("ą", "a")
+        .replace("ć", "c")
+        .replace("ę", "e")
+        .replace("ł", "l")
+        .replace("ń", "n")
+        .replace("ó", "o")
+        .replace("ś", "s")
+        .replace("ż", "z")
+        .replace("ź", "z")
+    )
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return " ".join(normalized.split())
 
 
 def parse_application_from_source_path(source_path: str, indexed_at: str = "") -> dict:
@@ -521,10 +637,9 @@ def is_application_source_path(source_path: str) -> bool:
     return any(token in normalized.split() for token in {"cv", "cvs", "lom", "loms"})
 
 
-def get_recent_application_records(file_mask: str | None = None) -> list[dict]:
-    snapshot = get_document_index_snapshot(file_mask)
+def application_records_from_snapshot(snapshot: dict) -> list[dict]:
     indexed_at_by_source = snapshot.get("indexed_at_by_source", {})
-    records = [
+    return [
         parse_application_from_source_path(
             source_path,
             indexed_at_by_source.get(source_path, ""),
@@ -532,6 +647,11 @@ def get_recent_application_records(file_mask: str | None = None) -> list[dict]:
         for source_path in snapshot["source_paths"]
         if is_application_source_path(source_path)
     ]
+
+
+def get_recent_application_records(file_mask: str | None = None) -> list[dict]:
+    snapshot = get_document_index_snapshot(file_mask)
+    records = application_records_from_snapshot(snapshot)
 
     return sorted(
         records,
@@ -544,19 +664,19 @@ def get_recent_application_records(file_mask: str | None = None) -> list[dict]:
     )
 
 
+def format_application_target(record: dict) -> str:
+    target = record["title"]
+    if record["company"] and record["role"]:
+        target = f"{record['company']} - {record['role']}"
+    elif record["role"]:
+        target = record["role"]
+
+    date_prefix = f"{record['date_label']}: " if record["date_label"] else ""
+    return f"{date_prefix}{target} ({record['source_path']})"
+
+
 def is_recent_application_question(user_input: str) -> bool:
-    normalized = user_input.lower()
-    normalized = (
-        normalized.replace("ą", "a")
-        .replace("ć", "c")
-        .replace("ę", "e")
-        .replace("ł", "l")
-        .replace("ń", "n")
-        .replace("ó", "o")
-        .replace("ś", "s")
-        .replace("ż", "z")
-        .replace("ź", "z")
-    )
+    normalized = normalize_for_matching(user_input)
 
     mentions_application = (
         "aplikow" in normalized
@@ -566,6 +686,166 @@ def is_recent_application_question(user_input: str) -> bool:
     asks_recent = "ostatnio" in normalized or "najnowsz" in normalized
     asks_target = "gdzie" in normalized or "rola" in normalized or "role" in normalized
     return mentions_application and asks_recent and asks_target
+
+
+def is_cv_portfolio_question(user_input: str) -> bool:
+    normalized = normalize_for_matching(user_input)
+    mentions_cv = bool(
+        re.search(r"\b(?:cv|cvs|resume|resumes|lom|loms)\b", normalized)
+    )
+    asks_analysis = any(
+        phrase in normalized
+        for phrase in (
+            "analiz",
+            "przeanaliz",
+            "podsum",
+            "doswiadcz",
+            "kompetenc",
+            "profil",
+            "wniosk",
+            "role",
+            "stanow",
+            "aplik",
+            "gdzie",
+            "jakie",
+            "wiele",
+            "wszyst",
+            "zindeks",
+            "kolekc",
+        )
+    )
+    return mentions_cv and asks_analysis
+
+
+def categorize_application_record(record: dict) -> str:
+    haystack = normalize_for_matching(
+        " ".join(
+            [
+                record.get("title", ""),
+                record.get("role", ""),
+                record.get("source_path", ""),
+            ]
+        )
+    )
+
+    for label, patterns in CV_ROLE_GROUPS:
+        if any(pattern in haystack for pattern in patterns):
+            return label
+
+    return "Other / ambiguous from filename"
+
+
+def clean_company_hint(company_hint: str) -> str:
+    cleaned = re.sub(
+        r"\b(?:senior|sr|principal|staff|hands on|ai assisted|deep|remote|hybrid)\b",
+        " ",
+        company_hint,
+        flags=re.I,
+    )
+    return " ".join(cleaned.split()).strip(" -_")
+
+
+def company_hint_for_record(record: dict) -> str:
+    company = clean_company_hint(record.get("company", ""))
+    if company:
+        return company
+
+    title_words = record.get("title", "").split()
+    if not title_words:
+        return "unknown"
+
+    return clean_company_hint(" ".join(title_words[:3])) or "unknown"
+
+
+def format_counter_lines(counter: Counter, total: int, limit: int = 7) -> list[str]:
+    lines = []
+    for label, count in counter.most_common(limit):
+        percentage = round((count / total) * 100) if total else 0
+        lines.append(f"- {label}: {count} ({percentage}%)")
+    return lines
+
+
+def format_cv_portfolio_response(records: list[dict], snapshot: dict) -> str:
+    if not records:
+        return (
+            "Nie znalazlem zindeksowanych plikow CV/LoM pasujacych do aktywnej maski."
+        )
+
+    sorted_records = sorted(
+        records,
+        key=lambda record: (
+            record["date_key"],
+            record["indexed_key"],
+            record["source_path"],
+        ),
+        reverse=True,
+    )
+    total = len(sorted_records)
+    role_counter = Counter(
+        categorize_application_record(record) for record in sorted_records
+    )
+    company_counter = Counter(
+        company_hint_for_record(record)
+        for record in sorted_records
+        if company_hint_for_record(record) != "unknown"
+    )
+    top_roles = ", ".join(label for label, _ in role_counter.most_common(3))
+    recent_records = [
+        record for record in sorted_records if record["date_key"] != (0, 0, 0)
+    ][:8] or sorted_records[:8]
+
+    lines = [
+        (
+            f"Przejrzalem {total} zindeksowanych plikow CV/LoM "
+            f"pasujacych do aktywnej maski ({snapshot['chunk_count']} chunkow). "
+            "Ponizej jest synteza z kolekcji, a nie powielenie podobnych fragmentow."
+        ),
+        "",
+        "Najmocniejszy obraz profilu:",
+        f"- Dominujace kierunki: {top_roles}.",
+        (
+            "- Portfolio wyglada na celowo wariantowane pod role managerskie, "
+            "agile/delivery i techniczne, zamiast jednego generycznego CV."
+        ),
+        (
+            "- Najbardziej czytelny positioning: Engineering Manager / Technical "
+            "Lead z mocnym tlem Scrum Master, Agile Delivery i platform engineering."
+        ),
+        "",
+        "Rozklad rol i obszarow z nazw plikow:",
+    ]
+    lines.extend(format_counter_lines(role_counter, total))
+
+    if company_counter:
+        lines.extend(
+            [
+                "",
+                "Najczestsze targety/firmy z nazw plikow:",
+            ]
+        )
+        lines.extend(format_counter_lines(company_counter, total, limit=10))
+
+    lines.extend(
+        [
+            "",
+            "Najnowsze kierunki aplikacji z nazw plikow:",
+        ]
+    )
+    lines.extend(f"- {format_application_target(record)}" for record in recent_records)
+
+    lines.extend(
+        [
+            "",
+            (
+                "Wniosek: zamiast odpowiadac ogolnie, ze Pawel jest Scrum Masterem "
+                "albo Python developerem, lepsza odpowiedz powinna pokazac miks: "
+                "technical leadership, engineering management, Agile delivery oraz "
+                "platform/Linux/backend context."
+            ),
+        ]
+    )
+
+    return "\n".join(lines)
 
 
 def format_recent_applications_response(records: list[dict]) -> str:
@@ -592,14 +872,7 @@ def format_recent_applications_response(records: list[dict]) -> str:
 
     lines = [intro]
     for record in selected_records[:10]:
-        target = record["title"]
-        if record["company"] and record["role"]:
-            target = f"{record['company']} — {record['role']}"
-        elif record["role"]:
-            target = record["role"]
-
-        date_prefix = f"{record['date_label']}: " if record["date_label"] else ""
-        lines.append(f"- {date_prefix}{target} ({record['source_path']})")
+        lines.append(f"- {format_application_target(record)}")
 
     if len(selected_records) > 10:
         lines.append(f"- ... i jeszcze {len(selected_records) - 10}")
@@ -1224,6 +1497,107 @@ def replay_text(text: str, estimator: TokenRateEstimator):
         time.sleep(estimator.delay_seconds)
 
 
+def render_copy_response_button(content: str, button_id: str) -> None:
+    if not content:
+        return
+
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "-", button_id)
+    payload = json.dumps(content).replace("</", "<\\/")
+    components.html(
+        f"""
+        <style>
+            .copy-response-wrap {{
+                display: flex;
+                justify-content: flex-end;
+                margin: 0;
+                padding: 0;
+            }}
+            .copy-response-button {{
+                width: 32px;
+                height: 32px;
+                border: 1px solid rgba(128, 128, 128, 0.35);
+                border-radius: 6px;
+                background: rgba(128, 128, 128, 0.08);
+                color: inherit;
+                cursor: pointer;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                transition: background 120ms ease, border-color 120ms ease;
+            }}
+            .copy-response-button:hover {{
+                background: rgba(128, 128, 128, 0.18);
+                border-color: rgba(128, 128, 128, 0.55);
+            }}
+            .copy-response-button.copied {{
+                border-color: rgba(34, 197, 94, 0.75);
+            }}
+            .copy-response-button svg {{
+                width: 17px;
+                height: 17px;
+            }}
+        </style>
+        <div class="copy-response-wrap">
+            <button
+                id="{safe_id}"
+                class="copy-response-button"
+                title="Copy response"
+                aria-label="Copy response"
+                type="button"
+            >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="9" y="9" width="13" height="13" rx="2"></rect>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>
+            </button>
+        </div>
+        <script>
+            (() => {{
+                const button = document.getElementById("{safe_id}");
+                const text = {payload};
+
+                function markCopied() {{
+                    button.classList.add("copied");
+                    button.setAttribute("title", "Copied");
+                    setTimeout(() => {{
+                        button.classList.remove("copied");
+                        button.setAttribute("title", "Copy response");
+                    }}, 1200);
+                }}
+
+                function fallbackCopy(value) {{
+                    const area = document.createElement("textarea");
+                    area.value = value;
+                    area.setAttribute("readonly", "");
+                    area.style.position = "fixed";
+                    area.style.left = "-9999px";
+                    document.body.appendChild(area);
+                    area.select();
+                    document.execCommand("copy");
+                    document.body.removeChild(area);
+                }}
+
+                button.addEventListener("click", async () => {{
+                    try {{
+                        if (navigator.clipboard && window.isSecureContext) {{
+                            await navigator.clipboard.writeText(text);
+                        }} else {{
+                            fallbackCopy(text);
+                        }}
+                        markCopied();
+                    }} catch (error) {{
+                        fallbackCopy(text);
+                        markCopied();
+                    }}
+                }});
+            }})();
+        </script>
+        """,
+        height=38,
+    )
+
+
 def stream_chat_response(model, messages, estimator: TokenRateEstimator):
     previous_chunk_at = time.perf_counter()
     streamed_chunks = 0
@@ -1409,6 +1783,16 @@ def response_generator(user_input):
         yield from replay_text(response, estimator)
         return
 
+    if is_cv_portfolio_question(user_input):
+        snapshot = get_document_index_snapshot(get_active_file_mask())
+        response = format_cv_portfolio_response(
+            application_records_from_snapshot(snapshot),
+            snapshot,
+        )
+        estimator.update(estimate_token_count(response), 1)
+        yield from replay_text(response, estimator)
+        return
+
     try:
         model = ChatOllama(model=OLLAMA_MODEL, temperature=0)
         model_with_tools = model.bind_tools(DOCUMENT_TOOLS)
@@ -1519,9 +1903,14 @@ with st.sidebar:
             index_documents(file_mask, sidebar_progress_callback, prune_unmatched=True)
         st.rerun()
 
-for message in get_chat_history():
+for message_index, message in enumerate(get_chat_history()):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        if message["role"] == "assistant":
+            render_copy_response_button(
+                message["content"],
+                f"copy-history-{message_index}",
+            )
 
 # Accept user input
 if user_input := st.chat_input(CHAT_HINT):
@@ -1535,6 +1924,10 @@ if user_input := st.chat_input(CHAT_HINT):
     # Display assistant response in chat message container
     with st.chat_message("assistant"):
         response = st.write_stream(response_generator(user_input))
+        render_copy_response_button(
+            response,
+            f"copy-current-{len(chat_history)}",
+        )
 
     chat_history.append({"role": "assistant", "content": response})
     remember_exchange(user_input, response)
